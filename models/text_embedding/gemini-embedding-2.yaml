@@ -1,0 +1,14 @@
+# Stable multimodal embedding model:
+# https://ai.google.dev/gemini-api/docs/models/gemini-embedding-2
+model: gemini-embedding-2
+model_type: text-embedding
+model_properties:
+  context_size: 8192
+  max_chunks: 100
+pricing:
+  input: "0.2"
+  unit: "0.000001"
+  currency: USD
+features:
+  - vision
+

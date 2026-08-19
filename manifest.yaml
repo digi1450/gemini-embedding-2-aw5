@@ -1,0 +1,37 @@
+author: digi1450
+created_at: "2026-08-19T00:00:00+07:00"
+description:
+  en_US: Gemini Embedding 2 stable provider for the AW5 multimodal RAG pilot.
+icon: icon_s_en.svg
+label:
+  en_US: Gemini Embedding 2 (AW5)
+meta:
+  arch:
+    - amd64
+    - arm64
+  runner:
+    entrypoint: main
+    language: python
+    version: "3.12"
+  version: 0.0.1
+  minimum_dify_version: 1.11.0
+name: gemini_embedding_2_aw5
+plugins:
+  models:
+    - provider/gemini_embedding_2_aw5.yaml
+resource:
+  memory: 268435456
+  permission:
+    model:
+      enabled: true
+      llm: false
+      moderation: false
+      rerank: false
+      speech2text: false
+      text_embedding: true
+      tts: false
+    tool:
+      enabled: false
+type: plugin
+version: 0.1.0
+

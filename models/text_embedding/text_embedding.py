@@ -1,14 +1,16 @@
 import base64
 import binascii
 import logging
+import random
 import re
+import threading
 import time
-import numpy as np
-from typing import Optional, Union
 from collections.abc import Mapping
+from typing import Optional, Union
 
+import numpy as np
 from google import genai
-from google.genai import types
+from google.genai import errors as genai_errors, types
 from google.genai.types import EmbedContentConfig
 
 from dify_plugin import TextEmbeddingModel
@@ -37,6 +39,18 @@ TASK_TYPE_BY_INPUT_TYPE = {
 STABLE_EMBEDDING_2_MODEL = "gemini-embedding-2"
 STABLE_EMBEDDING_2_OUTPUT_DIMENSION = 1536
 
+# Keep sustained traffic comfortably below the observed project quota of
+# 200 model operations per minute. The limiter is shared by every model
+# instance in this plugin process, including text, image, and credential calls.
+REQUESTS_PER_MINUTE = 120
+MIN_REQUEST_INTERVAL_SECONDS = 60.0 / REQUESTS_PER_MINUTE
+MAX_RETRIES = 8
+MAX_RETRY_DELAY_SECONDS = 60.0
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+_RATE_LIMIT_LOCK = threading.Lock()
+_NEXT_REQUEST_AT = 0.0
+
 
 class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
     """
@@ -55,6 +69,55 @@ class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
     # Fallback token estimate for image content when API does not return statistics.
     # Google's documentation indicates images are processed at ~258 tokens on average.
     IMAGE_TOKEN_ESTIMATE = 258
+
+    @staticmethod
+    def _wait_for_rate_slot() -> None:
+        """Reserve one process-wide API request slot and wait until it is due."""
+        global _NEXT_REQUEST_AT
+
+        with _RATE_LIMIT_LOCK:
+            now = time.monotonic()
+            request_at = max(now, _NEXT_REQUEST_AT)
+            _NEXT_REQUEST_AT = request_at + MIN_REQUEST_INTERVAL_SECONDS
+
+        delay = request_at - now
+        if delay > 0:
+            time.sleep(delay)
+
+    def _embed_content_with_retry(
+        self,
+        client: genai.Client,
+        *,
+        model: str,
+        contents,
+        config: Optional[EmbedContentConfig] = None,
+    ):
+        """Call Gemini embedding with throttling and bounded exponential backoff."""
+        for attempt in range(MAX_RETRIES + 1):
+            self._wait_for_rate_slot()
+            try:
+                return client.models.embed_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+            except genai_errors.APIError as ex:
+                if ex.code not in RETRYABLE_STATUS_CODES or attempt >= MAX_RETRIES:
+                    raise
+
+                delay = min(MAX_RETRY_DELAY_SECONDS, 2**attempt)
+                delay += random.uniform(0.0, 1.0)
+                logger.warning(
+                    "Gemini embedding request failed with HTTP %s; retrying in %.1fs "
+                    "(attempt %s/%s)",
+                    ex.code,
+                    delay,
+                    attempt + 1,
+                    MAX_RETRIES,
+                )
+                time.sleep(delay)
+
+        raise InvokeError(f"Unable to get embeddings from '{model}' model")
 
     @staticmethod
     def _as_user_content(part: Union[str, types.Part]) -> types.UserContent:
@@ -247,27 +310,15 @@ class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
 
     def _count_tokens(self, client: genai.Client, model: str, text: str) -> int:
         """
-        Count the number of tokens in the given text using the specified model or GPT-2 as a fallback.
+        Estimate tokens locally without consuming Gemini model-operation quota.
 
         :param client: model client
         :param model: model name
         :param text: text to embed
         :return: estimated token count
         """
-        # in case the model does not support count_token action
-        # we can use the flash-lite model to approximate the token count
-        count_model = (
-            model
-            if "countTokens" in (client.models.get(model=model).supported_actions or [])
-            else "gemini-2.0-flash-lite"
-        )
-        try:
-            response = client.models.count_tokens(model=count_model, contents=[text])
-            if tokens := response.total_tokens:
-                return tokens
-            return self._get_num_tokens_by_gpt2(text)
-        except Exception as ex:
-            raise RuntimeError(f"Error counting tokens: {ex}")
+        del client, model
+        return max(1, self._get_num_tokens_by_gpt2(text))
 
     def validate_credentials(self, model: str, credentials: Mapping) -> None:
         """
@@ -279,7 +330,11 @@ class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
         """
         try:
             client = genai.Client(api_key=credentials["google_api_key"])
-            client.models.embed_content(model=model, contents=["ping"])
+            self._embed_content_with_retry(
+                client,
+                model=model,
+                contents=["ping"],
+            )
         except Exception as ex:
             raise CredentialsValidateFailedError(str(ex))
 
@@ -307,8 +362,11 @@ class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
         ]
         contents = [self._as_user_content(text) for text in prepared_texts]
         config = self._embedding_config(model, input_type)
-        response = client.models.embed_content(
-            model=model, contents=contents, config=config
+        response = self._embed_content_with_retry(
+            client,
+            model=model,
+            contents=contents,
+            config=config,
         )
 
         if response.embeddings is None:
@@ -484,28 +542,55 @@ class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
         embeddings = []
         used_tokens = 0
 
-        # Process in batches
-        for i in range(0, len(contents), max_chunks):
-            batch_contents = contents[i : i + max_chunks]
+        # Build batches without changing document order. Gemini Embedding 2
+        # accepts at most six images in one request, while Dify may send many
+        # more images in a single multimodal invocation.
+        batches = []
+        batch_contents = []
+        batch_is_image = []
+        batch_original_texts = []
+        batch_image_count = 0
 
-            # Validate per-batch image count limit
-            # Gemini Embedding 2 supports at most 6 images per API request
-            batch_image_count = sum(content_is_image[i : i + max_chunks])
-            if batch_image_count > self.MAX_IMAGES_PER_REQUEST:
-                raise ValueError(
-                    f"Too many images in batch: {batch_image_count}. "
-                    f"Gemini Embedding 2 supports at most {self.MAX_IMAGES_PER_REQUEST} images per request."
-                )
-
-            # Prepare config with optional output_dimension (MRL support)
-            output_dimension = self._get_output_dimension(model, credentials)
-            config = self._embedding_config(
-                model, input_type, output_dimension=output_dimension
+        for content, is_image, original_text in zip(
+            contents, content_is_image, original_texts, strict=True
+        ):
+            exceeds_chunk_limit = len(batch_contents) >= max_chunks
+            exceeds_image_limit = (
+                is_image and batch_image_count >= self.MAX_IMAGES_PER_REQUEST
             )
+            if batch_contents and (exceeds_chunk_limit or exceeds_image_limit):
+                batches.append(
+                    (batch_contents, batch_is_image, batch_original_texts)
+                )
+                batch_contents = []
+                batch_is_image = []
+                batch_original_texts = []
+                batch_image_count = 0
+
+            batch_contents.append(content)
+            batch_is_image.append(is_image)
+            batch_original_texts.append(original_text)
+            if is_image:
+                batch_image_count += 1
+
+        if batch_contents:
+            batches.append((batch_contents, batch_is_image, batch_original_texts))
+
+        # Prepare config with optional output_dimension (MRL support)
+        output_dimension = self._get_output_dimension(model, credentials)
+        config = self._embedding_config(
+            model, input_type, output_dimension=output_dimension
+        )
+
+        # Process each safe-sized batch and concatenate the results in order.
+        for batch_contents, batch_is_image, batch_original_texts in batches:
 
             # Call embedding API
-            response = client.models.embed_content(
-                model=model, contents=batch_contents, config=config
+            response = self._embed_content_with_retry(
+                client,
+                model=model,
+                contents=batch_contents,
+                config=config,
             )
 
             if response.embeddings is None:
@@ -518,8 +603,6 @@ class GeminiTextEmbeddingModel(_CommonGemini, TextEmbeddingModel):
                 )
 
             # Process embeddings
-            batch_original_texts = original_texts[i : i + max_chunks]
-            batch_is_image = content_is_image[i : i + max_chunks]
             for j, embedding in enumerate(response.embeddings):
                 embedding_values = embedding.values or []
                 embeddings.append(embedding_values)

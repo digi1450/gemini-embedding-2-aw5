@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
+from google.genai import errors as genai_errors
 from google.genai import types
 from dify_plugin.entities.model import EmbeddingInputType
 from dify_plugin.entities.model.text_embedding import (
@@ -80,6 +81,16 @@ def _mock_embedding(values=None, token_count=None):
 def embedding_model():
     """Create an embedding model instance for testing."""
     return GeminiTextEmbeddingModel([])
+
+
+@pytest.fixture(autouse=True)
+def disable_rate_limit_wait(monkeypatch):
+    """Unit tests use mocked clients and must not wait for real API slots."""
+    monkeypatch.setattr(
+        GeminiTextEmbeddingModel,
+        "_wait_for_rate_slot",
+        staticmethod(lambda: None),
+    )
 
 
 # ================================================================
@@ -165,6 +176,49 @@ class TestEmbedContentRequestShape:
         assert contents[1].parts[0].inline_data.mime_type == "image/jpeg"
         assert contents[2].parts[0].text == "World"
 
+    @patch("models.text_embedding.text_embedding.genai")
+    def test_multimodal_images_are_split_into_six_image_batches(self, mock_genai):
+        """Dify batches with many images must be split without losing order."""
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+
+        next_embedding = 0
+
+        def embed_batch(*args, **kwargs):
+            nonlocal next_embedding
+            response = Mock()
+            response.embeddings = []
+            for _ in kwargs["contents"]:
+                response.embeddings.append(
+                    _mock_embedding(values=[float(next_embedding)], token_count=1)
+                )
+                next_embedding += 1
+            return response
+
+        mock_client.models.embed_content.side_effect = embed_batch
+
+        usage = _make_usage()
+        with (
+            patch.object(self.model, "_get_max_chunks", return_value=100),
+            patch.object(self.model, "_get_output_dimension", return_value=None),
+            patch.object(self.model, "_calc_response_usage", return_value=usage),
+        ):
+            result = self.model._invoke_multimodal(
+                model="gemini-embedding-2",
+                credentials=self.credentials,
+                documents=[
+                    MultiModalContent(
+                        content_type=MultiModalContentType.IMAGE,
+                        content=JPEG_BASE64,
+                    )
+                    for _ in range(16)
+                ],
+            )
+
+        calls = mock_client.models.embed_content.call_args_list
+        assert [len(call.kwargs["contents"]) for call in calls] == [6, 6, 4]
+        assert result.embeddings == [[float(i)] for i in range(16)]
+
 
 class TestStableEmbedding2Compatibility:
     """Regression tests for the stable model's prompt and config contract."""
@@ -226,6 +280,81 @@ class TestStableEmbedding2Compatibility:
         kwargs = mock_client.models.embed_content.call_args.kwargs
         assert kwargs["contents"][0].parts[0].text == "query"
         assert kwargs["config"].task_type == "RETRIEVAL_QUERY"
+
+
+# ================================================================
+# Test: quota protection and retry behavior
+# ================================================================
+
+
+class TestQuotaProtection:
+    """Regression tests for the 429 RESOURCE_EXHAUSTED indexing failure."""
+
+    def setup_method(self):
+        self.model = GeminiTextEmbeddingModel([])
+
+    def test_chunk_token_count_is_local(self):
+        """Chunk sizing must not consume Gemini model-operation quota."""
+        mock_client = Mock()
+
+        with patch.object(self.model, "_get_num_tokens_by_gpt2", return_value=17):
+            result = self.model._count_tokens(
+                mock_client,
+                "gemini-embedding-2",
+                "ข้อความสำหรับทดสอบ",
+            )
+
+        assert result == 17
+        mock_client.models.get.assert_not_called()
+        mock_client.models.count_tokens.assert_not_called()
+
+    def test_retryable_429_is_retried(self):
+        """A temporary quota error should back off and retry the same request."""
+        mock_client = Mock()
+        mock_response = Mock()
+        mock_client.models.embed_content.side_effect = [
+            genai_errors.APIError(
+                429,
+                {
+                    "error": {
+                        "message": "quota exceeded",
+                        "status": "RESOURCE_EXHAUSTED",
+                    }
+                },
+            ),
+            mock_response,
+        ]
+
+        with (
+            patch("models.text_embedding.text_embedding.random.uniform", return_value=0),
+            patch("models.text_embedding.text_embedding.time.sleep") as mock_sleep,
+        ):
+            result = self.model._embed_content_with_retry(
+                mock_client,
+                model="gemini-embedding-2",
+                contents=["ping"],
+            )
+
+        assert result is mock_response
+        assert mock_client.models.embed_content.call_count == 2
+        mock_sleep.assert_called_once_with(1)
+
+    def test_nonretryable_400_is_not_retried(self):
+        """Invalid requests should fail immediately instead of wasting quota."""
+        mock_client = Mock()
+        mock_client.models.embed_content.side_effect = genai_errors.APIError(
+            400,
+            {"error": {"message": "bad request", "status": "INVALID_ARGUMENT"}},
+        )
+
+        with pytest.raises(genai_errors.APIError):
+            self.model._embed_content_with_retry(
+                mock_client,
+                model="gemini-embedding-2",
+                contents=["ping"],
+            )
+
+        mock_client.models.embed_content.assert_called_once()
 
 
 # ================================================================
@@ -417,15 +546,26 @@ class TestMultimodalImageCountLimit:
             assert len(result.embeddings) == 6
 
     @patch("models.text_embedding.text_embedding.genai")
-    def test_7_images_in_single_batch_raises(self, mock_genai):
-        """More than 6 images in a single batch should raise ValueError"""
+    def test_7_images_are_split_into_two_requests(self, mock_genai):
+        """Seven images should be sent as batches of six and one."""
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
+
+        mock_embedding = _mock_embedding(values=[0.1], token_count=1)
+
+        def side_effect_embed(**kwargs):
+            response = Mock()
+            response.embeddings = [mock_embedding] * len(kwargs["contents"])
+            return response
+
+        mock_client.models.embed_content.side_effect = side_effect_embed
+        usage = _make_usage()
 
         with (
             patch.object(self.model, "_get_context_size", return_value=8192),
             patch.object(self.model, "_get_max_chunks", return_value=100),
             patch.object(self.model, "_get_output_dimension", return_value=None),
+            patch.object(self.model, "_calc_response_usage", return_value=usage),
         ):
             documents = [
                 MultiModalContent(
@@ -435,12 +575,15 @@ class TestMultimodalImageCountLimit:
                 for _ in range(7)
             ]
 
-            with pytest.raises(ValueError, match="Too many images in batch"):
-                self.model._invoke_multimodal(
-                    model="gemini-embedding-2-preview",
-                    credentials=self.credentials,
-                    documents=documents,
-                )
+            result = self.model._invoke_multimodal(
+                model="gemini-embedding-2-preview",
+                credentials=self.credentials,
+                documents=documents,
+            )
+
+        calls = mock_client.models.embed_content.call_args_list
+        assert [len(call.kwargs["contents"]) for call in calls] == [6, 1]
+        assert len(result.embeddings) == 7
 
     @patch("models.text_embedding.text_embedding.genai")
     def test_images_spread_across_batches_passes(self, mock_genai):

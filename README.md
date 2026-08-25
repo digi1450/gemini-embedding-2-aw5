@@ -14,7 +14,16 @@ request field. This fork therefore:
 - formats RAG queries as `task: question answering | query: ...`;
 - formats text documents as `title: none | text: ...`;
 - omits `task_type` for the stable model;
-- requests 1536-dimensional embeddings for both text and images.
+- requests 1536-dimensional embeddings for both text and images;
+- splits multimodal requests so each Gemini call contains at most six images;
+- limits sustained model operations and retries temporary quota/server errors;
+- estimates chunk tokens locally instead of consuming Gemini model-operation quota.
+
+## Current version
+
+Version `0.1.4` is the AW5 deployment candidate. Its unit suite currently passes
+61 tests, with three credential-dependent live smoke tests skipped unless a local
+Remote Debug environment is configured.
 
 ## Safe development flow
 
@@ -33,4 +42,3 @@ Do not index the full 474-page SDS until a small multimodal pilot passes.
 
 Derived from `langgenius/dify-official-plugins`, Gemini plugin commit
 `c41f1679f41ccffdc35b363123ac89f583a9d88c` (retrieved 2026-08-19).
-

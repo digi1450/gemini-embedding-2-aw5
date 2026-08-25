@@ -1,4 +1,3 @@
-.git/
 .DS_Store
 .env
 .env.*
@@ -8,6 +7,4 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
-models/tests/
 *.difypkg
-Dockerfile
